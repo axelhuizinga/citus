@@ -95,6 +95,15 @@ bool EnableUniqueJobIds = true;
 static List *OperatorCache = NIL;
 
 
+/* context passed down in AddAnyValueAggregates mutator */
+typedef struct AddAnyValueAggregatesContext
+{
+	List *groupClauseList;
+	List *targetList;
+	List *groupByTargetEntryList;
+} AddAnyValueAggregatesContext;
+
+
 /* Local functions forward declarations for job creation */
 static Job * BuildJobTree(MultiTreeRoot *multiTree);
 static MultiNode * LeftMostNode(MultiTreeRoot *multiTree);
@@ -105,6 +114,7 @@ static Query * BuildReduceQuery(MultiExtendedOp *extendedOpNode, List *dependent
 static List * BaseRangeTableList(MultiNode *multiNode);
 static List * QueryTargetList(MultiNode *multiNode);
 static List * TargetEntryList(List *expressionList);
+static Node * AddAnyValueAggregates(Node *node, AddAnyValueAggregatesContext *context);
 static List * QueryGroupClauseList(MultiNode *multiNode);
 static List * QuerySelectClauseList(MultiNode *multiNode);
 static List * QueryJoinClauseList(MultiNode *multiNode);
@@ -696,13 +706,12 @@ BuildJobQuery(MultiNode *multiNode, List *dependentJobList)
 	 */
 	if (groupClauseList != NIL && isRepartitionJoin)
 	{
-		targetList = (List *) expression_tree_mutator((Node *) targetList,
-													  AddAnyValueAggregates,
-													  groupClauseList);
+		targetList = (List *) WrapGroupedVarsInAnyValueAggregate((Node *) targetList,
+																 groupClauseList,
+																 targetList);
 
-		havingQual = expression_tree_mutator((Node *) havingQual,
-											 AddAnyValueAggregates,
-											 groupClauseList);
+		havingQual = WrapGroupedVarsInAnyValueAggregate((Node *) havingQual,
+														groupClauseList, targetList);
 	}
 
 	/*
@@ -974,18 +983,72 @@ TargetEntryList(List *expressionList)
 
 
 /*
+ * WrapGroupedVarsInAnyValueAggregate finds Var nodes in the expression
+ * that do not refer to any GROUP BY column and wraps them in an any_value
+ * aggregate. These columns are allowed when the GROUP BY is on a primary
+ * key of a relation, but not if we wrap the relation in a subquery.
+ * However, since we still know the value is unique, any_value gives the
+ * right result.
+ */
+Node *
+WrapGroupedVarsInAnyValueAggregate(Node *expression, List *groupClauseList,
+								   List *targetList)
+{
+	AddAnyValueAggregatesContext context;
+	context.groupClauseList = groupClauseList;
+	context.targetList = targetList;
+
+	List *groupByTargetEntryList = NIL;
+	SortGroupClause *sortGroupClause = NULL;
+
+	/* build a list of target entries for GROUP BY clauses */
+	foreach_ptr(sortGroupClause, groupClauseList)
+	{
+		TargetEntry *targetEntry = get_sortgroupclause_tle(sortGroupClause, targetList);
+		if (targetEntry == NULL)
+		{
+			continue;
+		}
+
+		groupByTargetEntryList = lappend(groupByTargetEntryList, targetEntry);
+	}
+
+	context.groupByTargetEntryList = groupByTargetEntryList;
+
+	return expression_tree_mutator(expression, AddAnyValueAggregates, &context);
+}
+
+
+/*
  * AddAnyValueAggregates wraps all vars that do not appear in the GROUP BY
  * clause or are inside an aggregate function in an any_value aggregate
  * function. This is needed for repartition joins because primary keys are not
  * present on intermediate tables.
  */
-Node *
-AddAnyValueAggregates(Node *node, void *context)
+static Node *
+AddAnyValueAggregates(Node *node, AddAnyValueAggregatesContext *context)
 {
-	List *groupClauseList = context;
 	if (node == NULL)
 	{
 		return node;
+	}
+
+	if (IsA(node, Aggref) || IsA(node, GroupingFunc))
+	{
+		/* any column is allowed to appear in an aggregate or grouping */
+		return node;
+	}
+
+	/*
+	 * Expressions that appear in the GROUP BY clause are allowed.
+	 */
+	TargetEntry *groupByTargetEntry = NULL;
+	foreach_ptr(groupByTargetEntry, context->groupByTargetEntryList)
+	{
+		if (equal(node, groupByTargetEntry->expr))
+		{
+			return node;
+		}
 	}
 
 	if (IsA(node, Var))
@@ -1002,10 +1065,9 @@ AddAnyValueAggregates(Node *node, void *context)
 		agg->aggcollid = exprCollation((Node *) var);
 		return (Node *) agg;
 	}
-	if (IsA(node, TargetEntry))
+	else if (IsA(node, TargetEntry))
 	{
 		TargetEntry *targetEntry = (TargetEntry *) node;
-
 
 		/*
 		 * Stop searching this part of the tree if the targetEntry is part of
@@ -1014,7 +1076,7 @@ AddAnyValueAggregates(Node *node, void *context)
 		if (targetEntry->ressortgroupref != 0)
 		{
 			SortGroupClause *sortGroupClause = NULL;
-			foreach_ptr(sortGroupClause, groupClauseList)
+			foreach_ptr(sortGroupClause, context->groupClauseList)
 			{
 				if (sortGroupClause->tleSortGroupRef == targetEntry->ressortgroupref)
 				{
@@ -1022,10 +1084,6 @@ AddAnyValueAggregates(Node *node, void *context)
 				}
 			}
 		}
-	}
-	if (IsA(node, Aggref) || IsA(node, GroupingFunc))
-	{
-		return node;
 	}
 	return expression_tree_mutator(node, AddAnyValueAggregates, context);
 }
